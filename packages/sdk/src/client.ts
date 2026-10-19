@@ -28,6 +28,13 @@ import type {
   ActivityPageOptions,
 } from "./types.js";
 import {
+  AsyncPaginationIterator,
+  createPaginationIterator,
+  PaginationAbortedError,
+  PaginationLimitExceededError,
+  type AsyncPaginationIteratorOptions,
+} from "./pagination.js";
+import {
   TalosAPIError,
   TalosPaymentError,
   classifyTransportError,
@@ -52,6 +59,11 @@ import {
   type RequestSigner,
   type SigningControllerOptions,
 } from "./signing.js";
+import {
+  normalizeNetworkId,
+  resolveNetworkConfig,
+  type ResolvedNetworkConfig,
+} from "./stellar.js";
 
 // Legacy import path: `import { TalosAPIError } from "./client.js"`.
 export { TalosAPIError };
@@ -119,6 +131,19 @@ export interface TalosClientOptions {
   /** Bearer token (TALOS API key). Adds `Authorization: Bearer <key>` header. */
   apiKey?: string;
   /**
+   * Optional Stellar network id (`public` / `mainnet`, `testnet`, `futurenet`,
+   * `standalone`, or x402-style `stellar:<id>`). When set (alone or with
+   * {@link networkPassphrase}), validated at construction via
+   * {@link resolveNetworkConfig}. Omitting both preserves prior unbound behavior.
+   */
+  network?: string;
+  /**
+   * Optional Stellar network passphrase. When set with {@link network}, the
+   * pair must agree; when set alone, must be a well-known Stellar passphrase.
+   * Errors are privacy-safe and never echo secrets or raw payloads.
+   */
+  networkPassphrase?: string;
+  /**
    * Status-code retry policy (Retry-After aware). Active by default. When only
    * {@link TalosClientOptions.retry} is supplied, this policy is disabled so
    * the typed `retry` bounds govern exclusively.
@@ -149,6 +174,12 @@ export interface TalosClientOptions {
   /** Opt-in request signer. Omitting it preserves the legacy wire format. */
   signer?: RequestSigner;
   signing?: SigningControllerOptions;
+  /** Fetch implementation override for tests, middleware, and Node runtimes. */
+  fetch?: typeof globalThis.fetch;
+  retryPolicy?: RetryPolicyOptions;
+  timeoutMs?: number;
+  onError?: (event: TalosErrorEvent) => void;
+  chaosInjector?: ChaosInjector;
 }
 
 /**
@@ -440,6 +471,7 @@ export class TalosClient {
   private headers: Record<string, string>;
   private readonly retryPolicy: Required<RetryPolicyOptions>;
   private readonly retry: Required<RetryOptions>;
+  private readonly networkConfig?: ResolvedNetworkConfig;
   private readonly timeoutMs?: number;
   private readonly onError?: (event: TalosErrorEvent) => void;
   /**
@@ -449,6 +481,11 @@ export class TalosClient {
   private readonly fetchOverride?: typeof fetch;
   private readonly chaosInjector?: ChaosInjector;
   private signer?: SigningController;
+  private readonly fetchOverride?: typeof globalThis.fetch;
+  private readonly retryPolicy: Required<RetryOptions>;
+  private readonly timeoutMs?: number;
+  private readonly onError?: (event: TalosErrorEvent) => void;
+  private readonly chaosInjector?: ChaosInjector;
 
   constructor(options: TalosClientOptions = {}) {
     // An explicit `retry` config without `retryPolicy` opts out of the
@@ -456,6 +493,10 @@ export class TalosClient {
     const policyEnabled = options.retryPolicy !== undefined || options.retry === undefined;
     this.retryPolicy = resolveRetryPolicy(options.retryPolicy, policyEnabled);
     this.retry = resolveRetryOptions(options.retry);
+    this.networkConfig = resolveNetworkConfig({
+      network: options.network,
+      networkPassphrase: options.networkPassphrase,
+    });
     this.timeoutMs = options.timeoutMs;
     this.onError = options.onError;
     this.fetchOverride = options.fetch;
@@ -464,6 +505,10 @@ export class TalosClient {
       options.baseUrl ?? "https://talos-stellar.vercel.app"
     ).replace(/\/$/, "");
     this.headers = { "Content-Type": "application/json" };
+    this.fetchOverride = options.fetch;
+    this.timeoutMs = options.timeoutMs;
+    this.onError = options.onError;
+    this.chaosInjector = options.chaosInjector;
     if (options.apiKey) {
       this.headers["Authorization"] = `Bearer ${options.apiKey}`;
     }
@@ -484,6 +529,14 @@ export class TalosClient {
    */
   getRetryOptions(): ResolvedRetryOptions {
     return this.retry;
+  }
+
+  /**
+   * Effective Stellar network / passphrase after validation, or `undefined`
+   * when the client was constructed without a network binding.
+   */
+  getNetworkConfig(): ResolvedNetworkConfig | undefined {
+    return this.networkConfig;
   }
 
   /**
@@ -527,7 +580,13 @@ export class TalosClient {
 
   /** Resolve the fetch implementation per request. Prefer override; fall back to global. */
   private resolveFetch(): typeof fetch {
-    return this.fetchOverride ?? globalThis.fetch;
+    const fetchFn = this.fetchOverride ?? globalThis.fetch;
+    if (typeof fetchFn !== "function") {
+      throw new TalosTransportError(0, "Fetch implementation is unavailable", "", {
+        message: "Fetch implementation is unavailable",
+      });
+    }
+    return fetchFn;
   }
 
   // ── Internal helpers ───────────────────────────────────────
@@ -678,6 +737,30 @@ export class TalosClient {
     return Math.floor(this.retryPolicy.random() * delay);
   }
 
+  private parseRetryAfter(header: string | null): number | null {
+    if (!header) return null;
+    const trimmed = header.trim();
+    if (trimmed.length === 0) {
+      return null;
+    }
+    if (trimmed.length > 1024) {
+      return null;
+    }
+
+    const seconds = Number(trimmed);
+    if (!Number.isNaN(seconds)) {
+      return Math.max(0, seconds * 1000);
+    }
+
+    const parsedDate = Date.parse(trimmed);
+    if (!Number.isNaN(parsedDate)) {
+      const delta = parsedDate - Date.now();
+      return delta > 0 ? delta : 0;
+    }
+
+    return null;
+  }
+
   private wait(delayMs: number, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) {
       return Promise.reject(new Error("Request aborted"));
@@ -707,6 +790,15 @@ export class TalosClient {
     if (!configured || configured <= 1) return 1;
     if (this.retry.idempotentOnly && !idempotent) return 1;
     return Math.max(1, Math.min(configured, MAX_TYPED_RETRY_ATTEMPTS));
+  }
+
+  /**
+   * Detect whether the client is operating in a legacy environment lacking
+   * modern web features (e.g., `AbortController`, `crypto.randomUUID`).
+   * Returns `true` if the environment is modern, `false` otherwise.
+   */
+  private isModernEnvironment(): boolean {
+    return typeof AbortController !== "undefined" && typeof globalThis.crypto?.randomUUID === "function";
   }
 
   /**
@@ -792,6 +884,14 @@ export class TalosClient {
     const callerSignal = signal ?? undefined;
     const method = (requestInit.method ?? "GET").toUpperCase();
     const url = this.buildUrl(path, params);
+    if (!this.isModernEnvironment()) {
+      throw new TalosAPIError(
+        501,
+        "Client requires a modern environment with AbortController and crypto.randomUUID",
+        path,
+      );
+    }
+
 
     const extraHeaders: Record<string, string> = {};
     if (idempotencyKey !== undefined) {
@@ -892,6 +992,24 @@ export class TalosClient {
     return this.requestPage("/api/talos", params);
   }
 
+  /**
+   * Async iterator for paginated Talos list.
+   *
+   * @example
+   * ```ts
+   * for await (const talos of client.paginateTaloses({ limit: 50 })) {
+   *   console.log(talos.name);
+   * }
+   * ```
+   */
+  paginateTaloses(options?: AsyncPaginationIteratorOptions & CursorRequestOptions): AsyncPaginationIterator<Talos> {
+    const { maxPages, signal, timeoutMs, ...cursorOptions } = options ?? {};
+    return createPaginationIterator<Talos>(
+      (opts) => this.listTaloses({ ...cursorOptions, ...opts }),
+      { maxPages, signal, timeoutMs },
+    );
+  }
+
   async getTalos(id: string, options?: ReadOptions): Promise<TalosDetail> {
     return this.request(`/api/talos/${id}`, { signal: options?.signal, timeoutMs: options?.timeoutMs });
   }
@@ -928,6 +1046,7 @@ export class TalosClient {
       body: JSON.stringify(params),
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 
@@ -947,6 +1066,7 @@ export class TalosClient {
       body: JSON.stringify(params),
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 
@@ -966,6 +1086,7 @@ export class TalosClient {
       body: JSON.stringify(params),
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 
@@ -1007,6 +1128,24 @@ export class TalosClient {
     return this.requestPage("/api/services", { ...query, signal, timeoutMs });
   }
 
+  /**
+   * Async iterator for paginated service discovery.
+   *
+   * @example
+   * ```ts
+   * for await (const service of client.paginateServices({ category: "Marketing" })) {
+   *   console.log(service.serviceName, service.price);
+   * }
+   * ```
+   */
+  paginateServices(options?: AsyncPaginationIteratorOptions & DiscoverServicesParams): AsyncPaginationIterator<CommerceService> {
+    const { maxPages, signal, timeoutMs, ...cursorOptions } = options ?? {};
+    return createPaginationIterator<CommerceService>(
+      (opts) => this.discoverServices({ ...cursorOptions, ...opts }),
+      { maxPages, signal, timeoutMs },
+    );
+  }
+
   async purchaseService(
     talosId: string,
     params: PurchaseServiceParams,
@@ -1018,6 +1157,7 @@ export class TalosClient {
       headers: { "X-PAYMENT": params.paymentHeader },
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 
@@ -1115,6 +1255,26 @@ export class TalosClient {
         });
       }
 
+      // When the client is bound to a Stellar network, reject challenges that
+      // target a different (or unrecognized) network. Unbound clients skip.
+      if (this.networkConfig && challenge.network) {
+        let challengeNetwork;
+        try {
+          challengeNetwork = normalizeNetworkId(challenge.network);
+        } catch {
+          throw new TalosPaymentError(402, "Invalid x402 challenge", path, {
+            message: "x402 challenge network is not recognized",
+            headers: { "www-authenticate": authHeader },
+          });
+        }
+        if (challengeNetwork !== this.networkConfig.network) {
+          throw new TalosPaymentError(402, "Invalid x402 challenge", path, {
+            message: "x402 challenge network does not match client network",
+            headers: { "www-authenticate": authHeader },
+          });
+        }
+      }
+
       emitDiag(challenge, "challenge_parsed");
 
       // 3. Request signature from the Web API. Guard against a non-numeric
@@ -1209,6 +1369,7 @@ export class TalosClient {
       body: JSON.stringify(params),
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 
@@ -1235,6 +1396,7 @@ export class TalosClient {
       body: JSON.stringify({ result }),
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 
@@ -1248,6 +1410,24 @@ export class TalosClient {
     params?: CursorRequestOptions,
   ): Promise<CursorPage<LeaderboardEntry>> {
     return this.requestPage("/api/leaderboard", params);
+  }
+
+  /**
+   * Async iterator for paginated leaderboard.
+   *
+   * @example
+   * ```ts
+   * for await (const entry of client.paginateLeaderboard({ limit: 50 })) {
+   *   console.log(entry.name, entry.totalRevenue);
+   * }
+   * ```
+   */
+  paginateLeaderboard(options?: AsyncPaginationIteratorOptions & CursorRequestOptions): AsyncPaginationIterator<LeaderboardEntry> {
+    const { maxPages, signal, timeoutMs, ...cursorOptions } = options ?? {};
+    return createPaginationIterator<LeaderboardEntry>(
+      (opts) => this.getLeaderboard({ ...cursorOptions, ...opts }),
+      { maxPages, signal, timeoutMs },
+    );
   }
 
   // ── Playbooks ──────────────────────────────────────────────
@@ -1264,6 +1444,30 @@ export class TalosClient {
     return this.requestPage("/api/playbooks", params);
   }
 
+  /**
+   * Async iterator for paginated playbooks.
+   *
+   * @example
+   * ```ts
+   * for await (const playbook of client.paginatePlaybooks({ category: "Marketing" })) {
+   *   console.log(playbook.title, playbook.price);
+   * }
+   * ```
+   */
+  paginatePlaybooks(options?: AsyncPaginationIteratorOptions & {
+    category?: string;
+    channel?: string;
+    search?: string;
+    sort?: "createdAt" | "price" | "title";
+    direction?: "asc" | "desc";
+  } & CursorRequestOptions): AsyncPaginationIterator<Playbook> {
+    const { maxPages, signal, timeoutMs, ...cursorOptions } = options ?? {};
+    return createPaginationIterator<Playbook>(
+      (opts) => this.listPlaybooks({ ...cursorOptions, ...opts }),
+      { maxPages, signal, timeoutMs },
+    );
+  }
+
   async createPlaybook(
     params: CreatePlaybookParams,
     options?: WriteOptions,
@@ -1273,6 +1477,7 @@ export class TalosClient {
       body: JSON.stringify(params),
       idempotencyKey: options?.idempotencyKey,
       signal: options?.signal,
+      timeoutMs: options?.timeoutMs,
     });
   }
 }

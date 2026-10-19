@@ -237,12 +237,17 @@ await TalosWebhook.verify({
 #### Troubleshooting
 - **"Missing or invalid timestamp"**: Ensure the `Talos-Signature` header is correctly passed from the request.
 - **"Timestamp outside tolerance zone"**: Check your server's NTP clock synchronization. If events are genuinely delayed, increase `toleranceSeconds`.
-- **"Signature mismatch"**: Ensure you are passing the *raw* request body (unparsed bytes) to the `payload` option. Frameworks like Express often parse JSON automatically; you need to bypass it or capture the raw buffer.
+- **"Signature mismatch"**: Ensure you are passing the *raw* request body (unparsed bytes) to the `payload` option. Frameworks like Express often parse JSON automatically; you need to bypass it or capture the raw buffer. This also surfaces if a `v1=` signature value isn't a well-formed hex string (even length, `0-9a-fA-F` only) — the SDK rejects malformed or non-canonical hex rather than attempting a partial decode.
 
 ### Stellar Helpers
 
 ```typescript
-import { generateKeypair, isValidPublicKey } from '@talos-protocol/sdk';
+import {
+  generateKeypair,
+  isValidPublicKey,
+  resolveNetworkConfig,
+  NETWORK_PASSPHRASES,
+} from '@talos-protocol/sdk';
 
 const { publicKey, secret } = generateKeypair();
 console.log("New Stellar Address:", publicKey);
@@ -250,7 +255,17 @@ console.log("New Stellar Address:", publicKey);
 if (isValidPublicKey(publicKey)) {
   console.log("Address is valid!");
 }
+
+// Bind the client to a known Stellar network (optional; omit for unbound).
+const network = resolveNetworkConfig({ network: "testnet" });
+// → { network: "testnet", networkPassphrase: NETWORK_PASSPHRASES.testnet }
 ```
+
+`TalosClient` accepts optional `network` / `networkPassphrase`. Either alone is
+enough; when both are set they must agree. Unknown ids, unrecognized passphrases,
+and mismatched pairs fail fast with privacy-safe `TypeError` / `RangeError`.
+Inspect the binding with `client.getNetworkConfig()`. When bound, x402 purchase
+challenges whose `network` field disagrees are rejected.
 
 ### Pluggable request signing
 
@@ -307,6 +322,56 @@ npm test
 
 Tests are implemented using Vitest and mock the global fetch function to avoid real network calls, ensuring fast and reliable test execution.
 
+### Deterministic chaos transport fixtures
+
+The `ChaosInjector` capability is safe to use in tests and CI because its
+behavior is pinned by a registry of named, reproducible scenarios with
+committed wire-level fixtures.
+
+```typescript
+import {
+  getChaosScenario,
+  planChaosScenario,
+  replayChaosScenario,
+  createSeededRandom,
+  ChaosInjector,
+  FaultType,
+} from '@talos-protocol/sdk';
+
+// Inspect the deterministic plan for a scenario (pure, no injection).
+const scenario = getChaosScenario('api-timeout-delay-then-throw')!;
+const plan = planChaosScenario(scenario);
+console.log(plan.calls[0].outcome); // "injected-delay-then-throw"
+
+// Replay it against a real injector — delays are instant by default.
+const result = await replayChaosScenario(scenario);
+console.log(result.totalDelayMs); // 100
+
+// Bring the same determinism to your own chaos setups.
+const injector = new ChaosInjector({ random: createSeededRandom(42) });
+injector.registerFault({ type: FaultType.NETWORK_DROP, probability: 0.5 });
+```
+
+Behavioral contract:
+
+- **Deterministic** — the same seed always produces the same injection
+  pattern, on any machine, Node version, or CI runner. The PRNG is pure JS
+  (`mulberry32`), so it works in Node, edge runtimes, and browsers alike.
+- **Explicit errors** — malformed fault configs fail loudly at registration
+  time with `TypeError`/`RangeError` (unknown fault types, non-finite or
+  out-of-range probabilities, negative durations). Previously these registered
+  silently and never fired.
+- **Boundary-pinned** — committed scenarios pin that probability `0` never
+  injects, `1` always injects, and a draw exactly equal to the probability
+  does **not** inject (strict `r < p`).
+- **Privacy-safe** — plans, replays, and the committed fixture
+  (`tests/fixtures/chaos-scenarios.json`) contain scenario names, seeds,
+  draws, and outcome labels only. Fault messages, request payloads,
+  credentials, and payment proofs are never logged, serialized, or returned.
+
+Keep the fixture in sync: `npm run fixtures:gen` regenerates it from the built
+ESM dist and `npm run fixtures:check` (wired into CI) fails on drift.
+
 ## API Reference
 
 ### Talos Management
@@ -343,6 +408,7 @@ working — new behavior is purely additive.
 | Status | Type | Code | Retryable | Extra fields |
 | --- | --- | --- | --- | --- |
 | 400 | `TalosValidationError` | `validation_error` | no | `issues: string[]` |
+| 422 | `TalosValidationError` | `validation_error` | no | `issues: string[]` |
 | 401 | `TalosAuthenticationError` | `authentication_error` | no | — |
 | 402 | `TalosPaymentError` | `payment_error` | no | `challenge?: { price, payee, token, … }` |
 | 403 | `TalosForbiddenError` | `forbidden` | no | — |
@@ -357,6 +423,14 @@ working — new behavior is purely additive.
 Every error also exposes:
 
 - `code` — stable string discriminator for `switch` / table look-ups.
+- `apiCode?` — the server's original machine-readable envelope code (for
+  example, `VALIDATION_ERROR`); distinct from the SDK's lowercase `code`.
+- `apiMessage` — the safe envelope `message` (or `error`) value. For malformed
+  and non-JSON bodies, this is a generic status-based fallback.
+- `validationDetails` — validation issue strings on every API error; the
+  `TalosValidationError.issues` field remains available as a compatible alias.
+- `status`, `requestId?`, and `headers` — HTTP status, correlation ID, and the
+  existing allowlisted response-header snapshot used for retry decisions.
 - `isRetryable` — hint to the caller.
 - `retryAfterMs?` — server-supplied retry hint, already in milliseconds.
   Populated from the `Retry-After` response header whenever it is present,
@@ -432,6 +506,8 @@ and attempt counts are hard-capped at 8. Inspect the effective policy with
 const client = new TalosClient({
   baseUrl: "https://talos-stellar.vercel.app",
   apiKey: process.env.TALOS_KEY!,
+  network: "testnet",                    // optional Stellar network binding
+  // networkPassphrase: NETWORK_PASSPHRASES.testnet,
   timeoutMs: 30_000,                     // per-request AbortController timeout
   retryPolicy: {
     maxAttempts: 3,                      // status-code policy (default on)
@@ -496,6 +572,10 @@ This version is **fully backward-compatible**:
 - All previous public APIs keep their signatures and return types.
 - `TalosAPIError` still has the `(status, body, path)` constructor — old
   `catch (e) { if (e instanceof TalosAPIError) … }` blocks keep working.
+- The existing `Error.message`, `body`, and SDK `code` discriminator retain
+  their prior behavior. Read the new `apiMessage` and `apiCode` fields for the
+  corresponding server-envelope values; `requestId`, retry headers, and
+  `TalosValidationError.issues` remain supported.
 - New fields (`code`, `isRetryable`, `retryAfterMs`, `requestId`, `headers`,
   `data`) are additive.
 - `retryAfterMs` is now populated for every error status that carries a
